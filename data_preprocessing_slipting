@@ -1,0 +1,139 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.impute import SimpleImputer
+import math
+import re
+from sklearn.model_selection import train_test_split
+
+# 1. Load Data
+data = pd.read_csv('China-historical-2016-en.csv')
+
+# Định nghĩa Target (Y) và Features (X)
+target_cols = ['pH','Dissolved Oxygen Saturation (%)','Dissolved Oxygen (mg/L)',
+               'Nitrate Nitrogen (mg/L)','Total Nitrogen (mg/L)','Temperature (deg C)']
+
+# Các cột không dùng để train nhưng cần để quản lý
+meta_cols = ['Date', 'Station'] 
+drop_cols = ['Water Control Zone', 'Source','Sample No','Depth'] # Cột bỏ đi
+
+# 2. Xử lý làm sạch (Clean Value) - Tách riêng ra để dễ kiểm soát
+def clean_value_logic(x):
+    if pd.isna(x): return np.nan
+    x = str(x).strip().lower()
+    if x in ["nd", "na", "-", ""]: return np.nan
+    
+    # Xử lý <LOD
+    if x.startswith("<"):
+        try:
+            lod = float(x.replace("<", "").strip())
+            return lod / math.sqrt(2) # Quy ước thay thế LOD
+        except: return np.nan
+        
+    # Xử lý số thường
+    x = re.sub(r"[^\d\.]", "", x)
+    try: return float(x)
+    except: return np.nan
+
+# Áp dụng clean cho các cột dữ liệu số (Trừ Date và Station)
+numeric_cols = [c for c in data.columns if c not in meta_cols + drop_cols]
+for col in numeric_cols:
+    data[col] = data[col].apply(clean_value_logic)
+
+# 3. Sắp xếp dữ liệu quan trọng nhất: Station -> Date
+# Convert Date sang datetime để sort đúng
+data['Date'] = pd.to_datetime(data['Date'], format='%d/%m/%Y', errors='coerce') # Check lại format date trong csv của bạn
+data = data.sort_values(by=['Station', 'Date']).reset_index(drop=True)
+
+# 4. Impute (CHƯA scale để tránh data leakage)
+# Lưu ý: Nên Impute theo từng trạm sẽ chính xác hơn, nhưng để đơn giản ta làm gộp trước
+feature_cols = [c for c in data.columns if c not in drop_cols + meta_cols] # Chỉ lấy cột số liệu
+
+# Tách X, Y
+data_values = data[feature_cols].values
+
+# Impute (fit trên toàn bộ data OK vì chỉ là fill missing values)
+imputer = SimpleImputer(strategy='mean')
+data_imputed = imputer.fit_transform(data_values)
+
+# Đưa lại vào DataFrame để dễ xử lý group
+df_processed = pd.DataFrame(data_imputed, columns=feature_cols)
+df_processed['Station'] = data['Station'] # Trả lại cột Station để group
+
+# 5. Hàm tạo Sequence thông minh (theo từng Station)
+def create_sequences_by_station(df, lookback=10, target_columns=target_cols):
+    X_seq, y_seq = [], []
+    
+    # Group by Station để không bị trượt cửa sổ qua trạm khác
+    for station_name, group in df.groupby('Station'):
+        group_values = group.drop(['Station'], axis=1).values # Bỏ cột Station đi, chỉ lấy số liệu
+        
+        if len(group_values) <= lookback: continue # Bỏ qua trạm quá ít dữ liệu
+            
+        for i in range(len(group_values) - lookback):
+            # X: Lấy từ i đến i+lookback (bao gồm cả các cột target trong quá khứ để làm feature)
+            X_seq.append(group_values[i : i + lookback])
+            
+            # y: Lấy giá trị tại thời điểm i + lookback (chỉ lấy cột target)
+            # Cần map index của target columns trong feature_cols
+            target_indices = [df.columns.get_loc(c) for c in target_columns]
+            y_seq.append(group_values[i + lookback, target_indices])
+            
+    return np.array(X_seq), np.array(y_seq)
+
+lookback = 10
+X, y = create_sequences_by_station(df_processed, lookback=lookback, target_columns=target_cols)
+
+print(f"X Shape trước scale: {X.shape}") # (Samples, 10, n_features)
+print(f"y Shape: {y.shape}") # (Samples, 6)
+
+# 6. Chia dữ liệu: Train - Valid - Test
+# Thay vì cắt thủ công bằng slice, dùng train_test_split để dễ quản lý tỷ lệ
+# Shuffle=False vì đây là dữ liệu chuỗi thời gian (TimeSeries)
+X_train_val, X_test, y_train_val, y_test = train_test_split(
+    X, y, test_size=0.15, shuffle=False
+)
+
+# Chia tiếp tập Train_val thành Train và Valid
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X_train_val, y_train_val, test_size=0.176, shuffle=False # ~15% của tổng data ban đầu
+)
+
+print(f"X_train shape: {X_train.shape}") # (~70%)
+print(f"X_valid shape: {X_valid.shape}") # (~15%)
+print(f"X_test shape: {X_test.shape}")   # (~15%)
+
+# 7. Scale - FIT CHỈ TRÊN TRAINING DATA
+# Khởi tạo scaler
+scaler_X = StandardScaler()
+scaler_y = StandardScaler() # Nên scale cả y nếu dùng các hàm loss như MSE để hội tụ nhanh hơn
+
+# Reshape X để fit (Samples * Lookback, Features)
+X_train_2d = X_train.reshape(-1, X_train.shape[-1])
+X_valid_2d = X_valid.reshape(-1, X_valid.shape[-1])
+X_test_2d = X_test.reshape(-1, X_test.shape[-1])
+
+# Fit & Transform X
+X_train_scaled_2d = scaler_X.fit_transform(X_train_2d)
+X_valid_scaled_2d = scaler_X.transform(X_valid_2d)
+X_test_scaled_2d = scaler_X.transform(X_test_2d)
+
+# Fit & Transform y (Nếu bạn muốn scale target)
+y_train = scaler_y.fit_transform(y_train)
+y_valid = scaler_y.transform(y_valid)
+y_test = scaler_y.transform(y_test)
+
+# Reshape X lại về 3D (Samples, Lookback, Features)
+X_train = X_train_scaled_2d.reshape(X_train.shape)
+X_valid = X_valid_scaled_2d.reshape(X_valid.shape)
+X_test = X_test_scaled_2d.reshape(X_test.shape)
+
+# 8. Chuyển đổi format cho PyTorch Conv1D
+# Format yêu cầu: (Batch, Channels, Sequence_Length)
+X_train = np.transpose(X_train, (0, 2, 1))
+X_valid = np.transpose(X_valid, (0, 2, 1))
+X_test = np.transpose(X_test, (0, 2, 1))
+
+print("--- Hoàn tất chuẩn bị dữ liệu ---")
+print(f"X_train final shape: {X_train.shape}") # Ví dụ: (Samples, n_features, 10)
+kiểm tra lại phần data để vào conv1d
