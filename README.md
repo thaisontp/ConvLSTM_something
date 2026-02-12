@@ -1,2 +1,2 @@
 # ConvLSTM_something
-  I wanna create a time series model for water quality prediction, aiming for multiple target prediction
+  You either die a hero or live long enough to see yourself become the villain
